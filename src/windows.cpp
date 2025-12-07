@@ -4,9 +4,9 @@
 TimestampType getCurrentTimestamp() {
 	LARGE_INTEGER t;
 	if (linuxNative) {
-		// used instead of QPC to make it possible to convert between Linux and Windows timestamps
 		GetSystemTimePreciseAsFileTime((FILETIME*)&t);
-	} else {
+	}
+	else {
 		QueryPerformanceCounter(&t);
 	}
 	return t.QuadPart;
@@ -22,10 +22,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 	bool inputState;
 	bool player1;
 
-	LPVOID pData;
 	switch (uMsg) {
 	case WM_INPUT: {
-
 		UINT dwSize;
 		GetRawInputData((HRAWINPUT)lParam, RID_INPUT, NULL, &dwSize, sizeof(RAWINPUTHEADER));
 
@@ -45,9 +43,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 			USHORT vkey = raw->data.keyboard.VKey;
 			inputState = raw->data.keyboard.Flags & RI_KEY_BREAK ? Release : Press;
 
-			if (vkey >= VK_NUMPAD0 && vkey <= VK_NUMPAD9) vkey -= 0x30; // make numpad numbers work with customkeybinds
+			if (vkey >= VK_NUMPAD0 && vkey <= VK_NUMPAD9) vkey -= 0x30;
 
-			// cocos2d::enumKeyCodes corresponds directly to vkeys
 			if (heldInputs.contains(vkey)) {
 				if (inputState) return 0;
 				else heldInputs.erase(vkey);
@@ -92,10 +89,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 				else if (flags & RI_MOUSE_BUTTON_2_UP) inputState = Release;
 				else return 0;
 
-				queueInMainThread([inputState]() {keybinds::InvokeBindEvent("robtop.geometry-dash/jump-p2", inputState).post();});
+				queueInMainThread([inputState]() {
+					keybinds::InvokeBindEvent("robtop.geometry-dash/jump-p2", inputState).post();
+					});
 			}
 
-			QueryPerformanceCounter(&time); // dont call on mouse move events
+			QueryPerformanceCounter(&time);
 			break;
 		}
 		default:
@@ -107,9 +106,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 		return DefWindowProcA(hwnd, uMsg, wParam, lParam);
 	}
 
-	{
-		std::lock_guard lock(inputQueueLock);
-		inputQueue.emplace_back(InputEvent{ timestampFromLarge(time), inputType, inputState, player1 });
+	// Push to lock-free queue - no mutex needed!
+	InputEvent ev{ timestampFromLarge(time), inputType, inputState, player1 };
+	if (!inputQueue.push(ev)) {
+		log::warn("Input queue full, dropping input");
 	}
 
 	return 0;
@@ -130,13 +130,13 @@ void rawInputThread() {
 	}
 
 	RAWINPUTDEVICE dev[2];
-	dev[0].usUsagePage = 0x01;        // generic desktop controls
-	dev[0].usUsage = 0x02;            // mouse
-	dev[0].dwFlags = RIDEV_INPUTSINK; // allow inputs without being in the foreground
-	dev[0].hwndTarget = hwnd;         // raw input window
+	dev[0].usUsagePage = 0x01;
+	dev[0].usUsage = 0x02;
+	dev[0].dwFlags = RIDEV_INPUTSINK;
+	dev[0].hwndTarget = hwnd;
 
 	dev[1].usUsagePage = 0x01;
-	dev[1].usUsage = 0x06;            // keyboard
+	dev[1].usUsage = 0x06;
 	dev[1].dwFlags = RIDEV_INPUTSINK;
 	dev[1].hwndTarget = hwnd;
 
@@ -148,173 +148,171 @@ void rawInputThread() {
 	if (threadPriority) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
 	MSG msg;
-    while (GetMessage(&msg, hwnd, 0, 0)) {
-        DispatchMessage(&msg);
-        while (softToggle.load()) { // reduce lag while mod is disabled
-            Sleep(2000);
-            while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)); // clear all pending messages
-        }
-    }
+	while (GetMessage(&msg, hwnd, 0, 0)) {
+		DispatchMessage(&msg);
+		while (softToggle.load()) {
+			Sleep(2000);
+			while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE));
+		}
+	}
 }
 
 void xinputThread() {
-    const HMODULE xinputLib = LoadLibrary("Xinput1_4.dll");
-    if (xinputLib == NULL) {
-        log::error("Failed to load Xinput1_4.dll");
-        return;
-    }
-    typedef DWORD(WINAPI* XInputGetState_t)(DWORD, XINPUT_STATE*);
-    const auto XInputGetState = (XInputGetState_t)GetProcAddress(xinputLib, "XInputGetState");
+	const HMODULE xinputLib = LoadLibrary("Xinput1_4.dll");
+	if (xinputLib == NULL) {
+		log::error("Failed to load Xinput1_4.dll");
+		return;
+	}
+	typedef DWORD(WINAPI* XInputGetState_t)(DWORD, XINPUT_STATE*);
+	const auto XInputGetState = (XInputGetState_t)GetProcAddress(xinputLib, "XInputGetState");
 
-    // cocos2d doesn't match with Xinput
-    std::array<std::pair<int, enumKeyCodes>, 22> xinputToCCKey = {
-        std::pair { XINPUT_GAMEPAD_DPAD_UP, CONTROLLER_Up },
-        std::pair { XINPUT_GAMEPAD_DPAD_DOWN, CONTROLLER_Down },
-        std::pair { XINPUT_GAMEPAD_DPAD_LEFT, CONTROLLER_Left },
-        std::pair { XINPUT_GAMEPAD_DPAD_RIGHT, CONTROLLER_Right },
-        std::pair { XINPUT_GAMEPAD_START, CONTROLLER_Start },
-        std::pair { XINPUT_GAMEPAD_BACK, CONTROLLER_Back },
-        std::pair { XINPUT_GAMEPAD_LEFT_SHOULDER, CONTROLLER_LB },
-        std::pair { XINPUT_GAMEPAD_RIGHT_SHOULDER, CONTROLLER_RB },
-        std::pair { XINPUT_GAMEPAD_A, CONTROLLER_A },
-        std::pair { XINPUT_GAMEPAD_B, CONTROLLER_B },
-        std::pair { XINPUT_GAMEPAD_X, CONTROLLER_X },
-        std::pair { XINPUT_GAMEPAD_Y, CONTROLLER_Y },
-        std::pair { -1, CONTROLLER_LT },
-        std::pair { -1, CONTROLLER_RT },
-        std::pair { -1, CONTROLLER_LTHUMBSTICK_UP },
-        std::pair { -1, CONTROLLER_LTHUMBSTICK_DOWN },
-        std::pair { -1, CONTROLLER_LTHUMBSTICK_LEFT },
-        std::pair { -1, CONTROLLER_LTHUMBSTICK_RIGHT },
-        std::pair { -1, CONTROLLER_RTHUMBSTICK_UP },
-        std::pair { -1, CONTROLLER_RTHUMBSTICK_DOWN },
-        std::pair { -1, CONTROLLER_RTHUMBSTICK_LEFT },
-        std::pair { -1, CONTROLLER_RTHUMBSTICK_RIGHT }
-    };
+	std::array<std::pair<int, enumKeyCodes>, 22> xinputToCCKey = {
+		std::pair { XINPUT_GAMEPAD_DPAD_UP, CONTROLLER_Up },
+		std::pair { XINPUT_GAMEPAD_DPAD_DOWN, CONTROLLER_Down },
+		std::pair { XINPUT_GAMEPAD_DPAD_LEFT, CONTROLLER_Left },
+		std::pair { XINPUT_GAMEPAD_DPAD_RIGHT, CONTROLLER_Right },
+		std::pair { XINPUT_GAMEPAD_START, CONTROLLER_Start },
+		std::pair { XINPUT_GAMEPAD_BACK, CONTROLLER_Back },
+		std::pair { XINPUT_GAMEPAD_LEFT_SHOULDER, CONTROLLER_LB },
+		std::pair { XINPUT_GAMEPAD_RIGHT_SHOULDER, CONTROLLER_RB },
+		std::pair { XINPUT_GAMEPAD_A, CONTROLLER_A },
+		std::pair { XINPUT_GAMEPAD_B, CONTROLLER_B },
+		std::pair { XINPUT_GAMEPAD_X, CONTROLLER_X },
+		std::pair { XINPUT_GAMEPAD_Y, CONTROLLER_Y },
+		std::pair { -1, CONTROLLER_LT },
+		std::pair { -1, CONTROLLER_RT },
+		std::pair { -1, CONTROLLER_LTHUMBSTICK_UP },
+		std::pair { -1, CONTROLLER_LTHUMBSTICK_DOWN },
+		std::pair { -1, CONTROLLER_LTHUMBSTICK_LEFT },
+		std::pair { -1, CONTROLLER_LTHUMBSTICK_RIGHT },
+		std::pair { -1, CONTROLLER_RTHUMBSTICK_UP },
+		std::pair { -1, CONTROLLER_RTHUMBSTICK_DOWN },
+		std::pair { -1, CONTROLLER_RTHUMBSTICK_LEFT },
+		std::pair { -1, CONTROLLER_RTHUMBSTICK_RIGHT }
+	};
 
-    if (threadPriority) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+	if (threadPriority) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
-    bool xinputWorks = false;
+	bool xinputWorks = false;
 
-    do {
-        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+	do {
+		std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
 
-        DWORD dwResult;    
-        for (DWORD i = 0; i < XUSER_MAX_COUNT; i++ ) {
-            XINPUT_STATE state;
-            dwResult = XInputGetState(i, &state);
-            
-            // controller not connected
-            if (dwResult != ERROR_SUCCESS) {
-                continue;
-            }
+		DWORD dwResult;
+		for (DWORD i = 0; i < XUSER_MAX_COUNT; i++) {
+			XINPUT_STATE state;
+			dwResult = XInputGetState(i, &state);
 
-            xinputWorks = true;
+			if (dwResult != ERROR_SUCCESS) {
+				continue;
+			}
 
-            // log::debug("thumbstick left: ({}, {}), right: ({}, {})", state.Gamepad.sThumbLX, state.Gamepad.sThumbLY, state.Gamepad.sThumbRX, state.Gamepad.sThumbRY);
+			xinputWorks = true;
 
-            for (auto& [xinputButton, ccButton] : xinputToCCKey) {
-                bool inputState;
+			for (auto& [xinputButton, ccButton] : xinputToCCKey) {
+				bool buttonPressed;
 
-                bool buttonPressed = heldInputs.contains(ccButton);
-                // if it's not a joystick or trigger, we can just use & to check if the button is pressed
-                if (xinputButton != -1) {
-                    buttonPressed = state.Gamepad.wButtons & xinputButton;
-                } else { // otherwise we have to check the values
-                    switch (ccButton) {
-                    case CONTROLLER_LT:
-                        buttonPressed = state.Gamepad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
-                        break;
-                    case CONTROLLER_RT:
-                        buttonPressed = state.Gamepad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
-                        break;
-                    case CONTROLLER_LTHUMBSTICK_UP:
-                        buttonPressed = state.Gamepad.sThumbLY > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE;
-                        break;
-                    case CONTROLLER_LTHUMBSTICK_DOWN:
-                        buttonPressed = state.Gamepad.sThumbLY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE;
-                        break;
-                    case CONTROLLER_LTHUMBSTICK_LEFT:
-                        buttonPressed = state.Gamepad.sThumbLX < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE;
-                        break;
-                    case CONTROLLER_LTHUMBSTICK_RIGHT:
-                        buttonPressed = state.Gamepad.sThumbLX > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE;
-                        break;
-                    case CONTROLLER_RTHUMBSTICK_UP:
-                        buttonPressed = state.Gamepad.sThumbRY > XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE;
-                        break;
-                    case CONTROLLER_RTHUMBSTICK_DOWN:
-                        buttonPressed = state.Gamepad.sThumbRY < -XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE;
-                        break;
-                    case CONTROLLER_RTHUMBSTICK_LEFT:
-                        buttonPressed = state.Gamepad.sThumbRX < -XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE;
-                        break;
-                    case CONTROLLER_RTHUMBSTICK_RIGHT:
-                        buttonPressed = state.Gamepad.sThumbRX > XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE;
-                        break;
-                    default:
-                        // shouldn't be possible, just to prevent warnings
-                        continue;
-                    }
-                }
+				if (xinputButton != -1) {
+					buttonPressed = state.Gamepad.wButtons & xinputButton;
+				}
+				else {
+					switch (ccButton) {
+					case CONTROLLER_LT:
+						buttonPressed = state.Gamepad.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
+						break;
+					case CONTROLLER_RT:
+						buttonPressed = state.Gamepad.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
+						break;
+					case CONTROLLER_LTHUMBSTICK_UP:
+						buttonPressed = state.Gamepad.sThumbLY > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE;
+						break;
+					case CONTROLLER_LTHUMBSTICK_DOWN:
+						buttonPressed = state.Gamepad.sThumbLY < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE;
+						break;
+					case CONTROLLER_LTHUMBSTICK_LEFT:
+						buttonPressed = state.Gamepad.sThumbLX < -XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE;
+						break;
+					case CONTROLLER_LTHUMBSTICK_RIGHT:
+						buttonPressed = state.Gamepad.sThumbLX > XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE;
+						break;
+					case CONTROLLER_RTHUMBSTICK_UP:
+						buttonPressed = state.Gamepad.sThumbRY > XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE;
+						break;
+					case CONTROLLER_RTHUMBSTICK_DOWN:
+						buttonPressed = state.Gamepad.sThumbRY < -XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE;
+						break;
+					case CONTROLLER_RTHUMBSTICK_LEFT:
+						buttonPressed = state.Gamepad.sThumbRX < -XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE;
+						break;
+					case CONTROLLER_RTHUMBSTICK_RIGHT:
+						buttonPressed = state.Gamepad.sThumbRX > XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE;
+						break;
+					default:
+						continue;
+					}
+				}
 
-                if (buttonPressed) {
-                    if (heldInputs.contains(ccButton)) continue; // skip if already held
-                    heldInputs.emplace(ccButton);
-                    inputState = Press;
-                } else {
-                    if (!heldInputs.contains(ccButton)) continue; // skip if not held
-                    heldInputs.erase(ccButton);
-                    inputState = Release;
-                }
+				bool wasPressed = heldInputs.contains(ccButton);
+				bool inputState;
 
-                LARGE_INTEGER time;
-                QueryPerformanceCounter(&time);
-                PlayerButton inputType;
-                bool player1 = true;
+				if (buttonPressed && !wasPressed) {
+					heldInputs.emplace(ccButton);
+					inputState = Press;
+				}
+				else if (!buttonPressed && wasPressed) {
+					heldInputs.erase(ccButton);
+					inputState = Release;
+				}
+				else {
+					continue;
+				}
 
-                {
-                    std::lock_guard lock(keybindsLock);
+				LARGE_INTEGER time;
+				QueryPerformanceCounter(&time);
+				PlayerButton inputType;
+				bool player1 = true;
 
-                    if (inputBinds[p1Jump].contains(ccButton)) inputType = PlayerButton::Jump;
-                    else if (inputBinds[p1Left].contains(ccButton)) inputType = PlayerButton::Left;
-                    else if (inputBinds[p1Right].contains(ccButton)) inputType = PlayerButton::Right;
-                    else {
-                        player1 = false;
-                        if (inputBinds[p2Jump].contains(ccButton)) inputType = PlayerButton::Jump;
-                        else if (inputBinds[p2Left].contains(ccButton)) inputType = PlayerButton::Left;
-                        else if (inputBinds[p2Right].contains(ccButton)) inputType = PlayerButton::Right;
-                        else continue;
-                    }
-                }
-                {
-                    std::lock_guard lock(inputQueueLock);
-                    inputQueue.emplace_back(InputEvent{ timestampFromLarge(time), inputType, inputState, player1 });
-                }
-            }
-        }
-        std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
-        std::chrono::nanoseconds elapsed = end - start;
-        // reduce lag, inputs should still be accurate to 1/2000th of a second
-        std::this_thread::sleep_for(std::chrono::nanoseconds(500000) - elapsed);
-        while (softToggle.load()) { // reduce lag while mod is disabled
-            Sleep(2000);
-        }
-    } while (xinputWorks);
+				{
+					std::lock_guard lock(keybindsLock);
 
-    if (!xinputWorks) {
-        log::error("Xinput failed to read any controllers");
-    }
+					if (inputBinds[p1Jump].contains(ccButton)) inputType = PlayerButton::Jump;
+					else if (inputBinds[p1Left].contains(ccButton)) inputType = PlayerButton::Left;
+					else if (inputBinds[p1Right].contains(ccButton)) inputType = PlayerButton::Right;
+					else {
+						player1 = false;
+						if (inputBinds[p2Jump].contains(ccButton)) inputType = PlayerButton::Jump;
+						else if (inputBinds[p2Left].contains(ccButton)) inputType = PlayerButton::Left;
+						else if (inputBinds[p2Right].contains(ccButton)) inputType = PlayerButton::Right;
+						else continue;
+					}
+				}
+
+				InputEvent ev{ timestampFromLarge(time), inputType, inputState, player1 };
+				if (!inputQueue.push(ev)) {
+					log::warn("Input queue full, dropping input");
+				}
+			}
+		}
+		std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+		std::chrono::nanoseconds elapsed = end - start;
+		std::this_thread::sleep_for(std::chrono::nanoseconds(500000) - elapsed);
+		while (softToggle.load()) {
+			Sleep(2000);
+		}
+	} while (xinputWorks);
+
+	if (!xinputWorks) {
+		log::error("Xinput failed to read any controllers");
+	}
 }
 
-// notify the player if theres an issue with input on Linux
 #include <Geode/modify/CreatorLayer.hpp>
 class $modify(CreatorLayer) {
 	bool init() {
 		if (!CreatorLayer::init()) return false;
 
 		if (linuxNative) {
-			DWORD waitResult = WaitForSingleObject(hMutex, 5);
+			DWORD waitResult = WaitForSingleObject(hMutex, 100); // Increased timeout
 			if (waitResult == WAIT_OBJECT_0) {
 				if (static_cast<LinuxInputEvent*>(pBuf)[0].type == 3 && !softToggle.load()) {
 					log::error("Linux input failed");
@@ -329,10 +327,7 @@ class $modify(CreatorLayer) {
 				ReleaseMutex(hMutex);
 			}
 			else if (waitResult == WAIT_TIMEOUT) {
-				log::error("Mutex stalling");
-			}
-			else {
-				// log::error("CreatorLayer WaitForSingleObject failed: {}", GetLastError());
+				log::error("Mutex timeout during init check");
 			}
 		}
 		return true;
@@ -351,11 +346,11 @@ void linuxCheckInputs() {
 		{ BTN_START, CONTROLLER_Start },
 	};
 
-	DWORD waitResult = WaitForSingleObject(hMutex, 1);
+	DWORD waitResult = WaitForSingleObject(hMutex, 5); // Increased from 1ms
 	if (waitResult == WAIT_OBJECT_0) {
 		LinuxInputEvent* events = static_cast<LinuxInputEvent*>(pBuf);
 		for (int i = 0; i < BUFFER_SIZE; i++) {
-			if (events[i].type == 0) break; // if there are no more events
+			if (events[i].type == 0) break;
 
 			InputEvent input;
 			bool player1 = true;
@@ -389,7 +384,7 @@ void linuxCheckInputs() {
 				break;
 			}
 			case TOUCHSCREEN:
-				if (scanCode == BTN_TOUCH) { // touching screen
+				if (scanCode == BTN_TOUCH) {
 					input.inputType = PlayerButton::Jump;
 				}
 				break;
@@ -397,67 +392,64 @@ void linuxCheckInputs() {
 				int keyCode = -1;
 				if (events[i].type == EV_KEY) {
 					keyCode = linuxToCCKey[scanCode];
-				} else if (events[i].type == EV_ABS) {
+				}
+				else if (events[i].type == EV_ABS) {
 					bool continueLoop = false;
-					auto analyze4Directions = [&] (int deadzone, enumKeyCodes negative, enumKeyCodes positive) {
+					auto analyze4Directions = [&](int deadzone, enumKeyCodes negative, enumKeyCodes positive) {
 						if (events[i].value < -deadzone) {
 							keyCode = negative;
 							if (heldInputs.contains(negative)) {
-								continueLoop = true; // already held, ignore
+								continueLoop = true;
 							}
 							value = Press;
-						} else if (events[i].value > deadzone) {
+						}
+						else if (events[i].value > deadzone) {
 							keyCode = positive;
 							if (heldInputs.contains(positive)) {
-								continueLoop = true; // already held, ignore
+								continueLoop = true;
 							}
 							value = Press;
-						} else {
+						}
+						else {
 							value = Release;
 							if (heldInputs.contains(negative)) {
 								keyCode = negative;
-							} else if (heldInputs.contains(positive)) {
+							}
+							else if (heldInputs.contains(positive)) {
 								keyCode = positive;
-							} else {
-								continueLoop = true; // continue cuz button was already released
+							}
+							else {
+								continueLoop = true;
 							}
 						}
-					};
+						};
 
 					switch (events[i].code) {
-					case ABS_X: // left thumbstick x
+					case ABS_X:
 						analyze4Directions(XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, CONTROLLER_LTHUMBSTICK_LEFT, CONTROLLER_LTHUMBSTICK_RIGHT);
 						break;
-					case ABS_Y: // left thumbstick y
+					case ABS_Y:
 						analyze4Directions(XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE, CONTROLLER_LTHUMBSTICK_UP, CONTROLLER_LTHUMBSTICK_DOWN);
 						break;
-					case ABS_RX: // right thumbstick x
+					case ABS_RX:
 						analyze4Directions(XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE, CONTROLLER_RTHUMBSTICK_LEFT, CONTROLLER_RTHUMBSTICK_RIGHT);
 						break;
-					case ABS_RY: // right thumbstick y
+					case ABS_RY:
 						analyze4Directions(XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE, CONTROLLER_RTHUMBSTICK_UP, CONTROLLER_RTHUMBSTICK_DOWN);
 						break;
-					case ABS_HAT0X: // dpadx
+					case ABS_HAT0X:
 						analyze4Directions(10, CONTROLLER_Left, CONTROLLER_Right);
 						break;
-					case ABS_HAT0Y: // dpady
+					case ABS_HAT0Y:
 						analyze4Directions(10, CONTROLLER_Up, CONTROLLER_Down);
 						break;
 					case ABS_Z:
 						keyCode = CONTROLLER_LT;
-						if (events[i].value > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) {
-							value = Press;
-						} else {
-							value = Release;
-						}
+						value = (events[i].value > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) ? Press : Release;
 						break;
 					case ABS_RZ:
 						keyCode = CONTROLLER_RT;
-						if (events[i].value > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) {
-							value = Press;
-						} else {
-							value = Release;
-						}
+						value = (events[i].value > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) ? Press : Release;
 						break;
 					}
 					if (continueLoop) continue;
@@ -474,14 +466,17 @@ void linuxCheckInputs() {
 				}
 				if (value == Press) {
 					if (heldInputs.contains(keyCode)) {
-						continue; // already held, ignore
-					} else {
+						continue;
+					}
+					else {
 						heldInputs.emplace(keyCode);
 					}
-				} else {
+				}
+				else {
 					if (!heldInputs.contains(keyCode)) {
-						continue; // already released, ignore
-					} else {
+						continue;
+					}
+					else {
 						heldInputs.erase(keyCode);
 					}
 				}
@@ -495,12 +490,17 @@ void linuxCheckInputs() {
 			input.time = timestampFromLarge(events[i].time);
 			input.isPlayer1 = player1;
 
-			inputQueue.emplace_back(input);
+			if (!inputQueue.push(input)) {
+				log::warn("Input queue full, dropping Linux input");
+			}
 		}
 		ZeroMemory(events, sizeof(LinuxInputEvent[BUFFER_SIZE]));
 		ReleaseMutex(hMutex);
 	}
-	else if (waitResult != WAIT_TIMEOUT) {
+	else if (waitResult == WAIT_TIMEOUT) {
+		// Timeout is expected under heavy load, don't spam logs
+	}
+	else {
 		log::error("WaitForSingleObject failed: {}", GetLastError());
 	}
 }
@@ -509,9 +509,9 @@ void windowsSetup() {
 	HANDLE gdMutex;
 
 	HMODULE ntdll = GetModuleHandle("ntdll.dll");
-	typedef void (*wine_get_host_version)(const char **sysname, const char **release);
+	typedef void (*wine_get_host_version)(const char** sysname, const char** release);
 	wine_get_host_version wghv = (wine_get_host_version)GetProcAddress(ntdll, "wine_get_host_version");
-	if (wghv) { // if this function exists, the user is on Wine
+	if (wghv) {
 		const char* sysname;
 		const char* release;
 		wghv(&sysname, &release);
@@ -520,31 +520,31 @@ void windowsSetup() {
 		log::info("Wine {}", sys);
 
 		if (sys == "Linux") Mod::get()->setSavedValue<bool>("you-must-be-on-linux-to-change-this", true);
-		if (sys == "Linux" && Mod::get()->getSettingValue<bool>("wine-workaround")) { // background raw keyboard input doesn't work in Wine
+		if (sys == "Linux" && Mod::get()->getSettingValue<bool>("wine-workaround")) {
 			linuxNative = true;
-			log::info("Linux native");
+			log::info("Linux native mode enabled");
 
-			hSharedMem = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(LinuxInputEvent[BUFFER_SIZE]), "LinuxSharedMemory");
+			hSharedMem = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(LinuxInputEvent) * BUFFER_SIZE, "LinuxSharedMemory");
 			if (hSharedMem == NULL) {
 				log::error("Failed to create file mapping: {}", GetLastError());
 				return;
 			}
 
-			pBuf = MapViewOfFile(hSharedMem, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(LinuxInputEvent[BUFFER_SIZE]));
+			pBuf = MapViewOfFile(hSharedMem, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(LinuxInputEvent) * BUFFER_SIZE);
 			if (pBuf == NULL) {
 				log::error("Failed to map view of file: {}", GetLastError());
 				CloseHandle(hSharedMem);
 				return;
 			}
 
-			hMutex = CreateMutex(NULL, FALSE, "CBFLinuxMutex"); // used to gate access to the shared memory buffer for inputs
+			hMutex = CreateMutex(NULL, FALSE, "CBFLinuxMutex");
 			if (hMutex == NULL) {
 				log::error("Failed to create shared memory mutex: {}", GetLastError());
 				CloseHandle(hSharedMem);
 				return;
 			}
 
-			gdMutex = CreateMutex(NULL, TRUE, "CBFWatchdogMutex"); // will be released when gd closes
+			gdMutex = CreateMutex(NULL, TRUE, "CBFWatchdogMutex");
 			if (gdMutex == NULL) {
 				log::error("Failed to create watchdog mutex: {}", GetLastError());
 				CloseHandle(hMutex);

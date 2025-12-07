@@ -6,13 +6,17 @@ TimestampType pendingInputTimestamp = 0;
 class $modify(GJBaseGameLayer) {
 	void queueButton(int button, bool push, bool isPlayer2) {
 		if (!softToggle.load() && pendingInputTimestamp) {
-			std::lock_guard lock(inputQueueLock);
-			inputQueue.emplace_back(InputEvent {
+			InputEvent ev{
 				.time = pendingInputTimestamp,
 				.inputType = PlayerButton(button),
 				.inputState = push ? State::Press : State::Release,
 				.isPlayer1 = !isPlayer2
-			});
+			};
+
+			if (!inputQueue.push(ev)) {
+				// Fallback to slower method if queue is full
+				log::warn("Input queue full in queueButton");
+			}
 		}
 
 		GJBaseGameLayer::queueButton(button, push, isPlayer2);
