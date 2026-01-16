@@ -264,7 +264,6 @@ int main() {
 			}
 		}
 
-		// OPTIMIZATION: Reduced timeout from 100ms to 1ms for lower latency
 		int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1);
 		if (nfds == -1) {
 			if (errno == EINTR) continue;
@@ -332,7 +331,7 @@ int main() {
 					device_type = UNKNOWN;
 				}
 
-				DWORD waitResult = WaitForSingleObject(hMutex, 10); // Increased timeout
+				DWORD waitResult = WaitForSingleObject(hMutex, 10);
 				if (waitResult == WAIT_OBJECT_0) {
 					for (int i = 0; i < BUFFER_SIZE; i++) {
 						if (shared_events[i].type == 0) {

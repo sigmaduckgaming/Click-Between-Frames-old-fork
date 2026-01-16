@@ -11,98 +11,74 @@
 
 constexpr double SMALLEST_FLOAT = std::numeric_limits<float>::min();
 
-// EMA smoothing constants for physics bypass lag detection
-constexpr double EMA_ALPHA = 0.05;        // Weight for new samples
-constexpr double EMA_MAX_RATIO = 10.0;    // Max delta vs interval ratio
-constexpr double LAG_THRESHOLD = 0.0005;  // 0.5ms sustained lag threshold
-constexpr double STEP_EPSILON = 0.0001;   // Epsilon for step calculation
-
 constexpr InputEvent EMPTY_INPUT = InputEvent{
 	.time = 0,
 	.inputType = PlayerButton::Jump,
 	.inputState = false,
 	.isPlayer1 = false,
 };
-
 constexpr Step EMPTY_STEP = Step{
 	.input = EMPTY_INPUT,
 	.deltaFactor = 1.0,
 	.endStep = true,
 };
 
-LockFreeQueue<InputEvent, 1024> inputQueue;
-std::deque<InputEvent> inputQueueCopy;
-StepQueue stepQueue;
+std::deque<struct InputEvent> inputQueue;
+std::deque<struct InputEvent> inputQueueCopy;
+std::deque<struct Step> stepQueue;
 
-std::atomic<bool> softToggle{ false };
+std::atomic<bool> softToggle;
 
 InputEvent nextInput = EMPTY_INPUT;
 
-TimestampType lastFrameTime = 0;
-TimestampType currentFrameTime = 0;
+TimestampType lastFrameTime;
+TimestampType currentFrameTime;
 
 bool firstFrame = true;
 bool skipUpdate = true;
 bool enableInput = false;
 bool linuxNative = false;
-bool lateCutoff = false;
+bool lateCutoff;
 
 std::array<std::unordered_set<size_t>, 6> inputBinds;
 std::unordered_set<uint16_t> heldInputs;
 
+std::mutex inputQueueLock;
 std::mutex keybindsLock;
 
-std::atomic<bool> enableRightClick{ false };
-bool threadPriority = true;
-
-double averageDelta = 0.0;
-
-bool physicsBypass = false;
-bool legacyBypass = false;
-bool safeMode = false;
-bool clickOnSteps = false;
-bool mouseFix = false;
+std::atomic<bool> enableRightClick;
+bool threadPriority;
 
 /*
-Optimized step queue builder with physics-accurate collision handling
+Original implementation by theyareonit, with critical physics fix applied.
+This function builds a queue of steps based on when inputs occurred.
 */
 void buildStepQueue(int stepCount) {
 	PlayLayer* playLayer = PlayLayer::get();
 	nextInput = EMPTY_INPUT;
-	stepQueue.clear();
+	stepQueue = {}; // Original: dynamic deallocation
 
 	if (lateCutoff) {
+		currentFrameTime = getCurrentTimestamp();
 #ifdef GEODE_IS_WINDOWS
 		if (linuxNative) {
-			linuxCheckInputs(); // Process inputs BEFORE taking timestamp
+			linuxCheckInputs();
 		}
 #endif
-		currentFrameTime = getCurrentTimestamp();
 
-		// Pop all inputs from lock-free queue
-		inputQueueCopy.clear();
-		InputEvent ev;
-		while (inputQueue.pop(ev)) {
-			inputQueueCopy.push_back(ev);
-		}
+		std::lock_guard lock(inputQueueLock);
+		inputQueueCopy = inputQueue;
+		inputQueue = {};
 	}
 	else {
 #ifdef GEODE_IS_WINDOWS
 		if (linuxNative) linuxCheckInputs();
 #endif
 
-		// Only copy inputs that happened before frame start
-		inputQueueCopy.clear();
-		InputEvent ev;
-		while (inputQueue.pop(ev)) {
-			if (ev.time <= currentFrameTime) {
-				inputQueueCopy.push_back(ev);
-			}
-			else {
-				// Put it back for next frame
-				inputQueue.push(ev);
-				break;
-			}
+		std::lock_guard lock(inputQueueLock);
+		while (!inputQueue.empty() && inputQueue.front().time <= currentFrameTime) {
+			inputQueueCopy.push_back(inputQueue.front());
+			inputQueue.pop_front();
 		}
 	}
 
@@ -111,55 +87,41 @@ void buildStepQueue(int stepCount) {
 		skipUpdate = true;
 		firstFrame = false;
 		lastFrameTime = currentFrameTime;
-		if (!lateCutoff) inputQueueCopy.clear();
+		if (!lateCutoff) inputQueueCopy = {};
 		return;
 	}
 
-	const TimestampType deltaTime = currentFrameTime - lastFrameTime;
-	const TimestampType stepDelta = (deltaTime / stepCount) + 1;
+	TimestampType deltaTime = currentFrameTime - lastFrameTime;
+	TimestampType stepDelta = (deltaTime / stepCount) + 1;
 
-	// Early exit if no inputs - just create end steps
-	if (inputQueueCopy.empty()) {
-		for (int i = 0; i < stepCount; i++) {
-			stepQueue.push(Step{ EMPTY_INPUT, 1.0, true });
-		}
-		lastFrameTime = currentFrameTime;
-		return;
-	}
-
-	// Build step queue with precise input timing
 	for (int i = 0; i < stepCount; i++) {
 		double elapsedTime = 0.0;
-
 		while (!inputQueueCopy.empty()) {
-			const InputEvent& front = inputQueueCopy.front();
+			InputEvent front = inputQueueCopy.front();
 
 			if (front.time - lastFrameTime < stepDelta * (i + 1)) {
-				const double inputTime = static_cast<double>((front.time - lastFrameTime) % stepDelta) / stepDelta;
-				const double deltaFactor = std::clamp(inputTime - elapsedTime, SMALLEST_FLOAT, 1.0);
-
-				if (!stepQueue.push(Step{ front, deltaFactor, false })) {
-					log::error("Step queue overflow! This should never happen.");
-					break;
-				}
-
+				double inputTime = static_cast<double>((front.time - lastFrameTime) % stepDelta) / stepDelta;
+				stepQueue.emplace_back(Step{ front, std::clamp(inputTime - elapsedTime, SMALLEST_FLOAT, 1.0), false });
 				inputQueueCopy.pop_front();
 				elapsedTime = inputTime;
 			}
 			else break;
 		}
 
-		const double remainingTime = std::max(SMALLEST_FLOAT, 1.0 - elapsedTime);
-		stepQueue.push(Step{ EMPTY_INPUT, remainingTime, true });
+		stepQueue.emplace_back(Step{ EMPTY_INPUT, std::max(SMALLEST_FLOAT, 1.0 - elapsedTime), true });
 	}
 
 	lastFrameTime = currentFrameTime;
 }
 
+/*
+Original implementation - unchanged
+*/
 Step popStepQueue() {
 	if (stepQueue.empty()) return EMPTY_STEP;
 
-	Step front = stepQueue.pop();
+	Step front = stepQueue.front();
+	double deltaFactor = front.deltaFactor;
 
 	if (nextInput.time != 0) {
 		PlayLayer* playLayer = PlayLayer::get();
@@ -170,35 +132,40 @@ Step popStepQueue() {
 	}
 
 	nextInput = front.input;
+	stepQueue.pop_front();
+
 	return front;
 }
 
 #ifdef GEODE_IS_WINDOWS
 #include <geode.custom-keybinds/include/Keybinds.hpp>
 
+/*
+Original implementation - unchanged
+*/
 void updateKeybinds() {
 	std::array<std::unordered_set<size_t>, 6> binds;
 	std::vector<geode::Ref<keybinds::Bind>> v;
 
-	enableRightClick.store(Mod::get()->getSettingValue<bool>("right-click"), std::memory_order_relaxed);
+	enableRightClick.store(Mod::get()->getSettingValue<bool>("right-click"));
 
 	v = keybinds::BindManager::get()->getBindsFor("robtop.geometry-dash/jump-p1");
-	for (const auto& bind : v) binds[p1Jump].emplace(bind->getHash());
+	for (int i = 0; i < v.size(); i++) binds[p1Jump].emplace(v[i]->getHash());
 
 	v = keybinds::BindManager::get()->getBindsFor("robtop.geometry-dash/move-left-p1");
-	for (const auto& bind : v) binds[p1Left].emplace(bind->getHash());
+	for (int i = 0; i < v.size(); i++) binds[p1Left].emplace(v[i]->getHash());
 
 	v = keybinds::BindManager::get()->getBindsFor("robtop.geometry-dash/move-right-p1");
-	for (const auto& bind : v) binds[p1Right].emplace(bind->getHash());
+	for (int i = 0; i < v.size(); i++) binds[p1Right].emplace(v[i]->getHash());
 
 	v = keybinds::BindManager::get()->getBindsFor("robtop.geometry-dash/jump-p2");
-	for (const auto& bind : v) binds[p2Jump].emplace(bind->getHash());
+	for (int i = 0; i < v.size(); i++) binds[p2Jump].emplace(v[i]->getHash());
 
 	v = keybinds::BindManager::get()->getBindsFor("robtop.geometry-dash/move-left-p2");
-	for (const auto& bind : v) binds[p2Left].emplace(bind->getHash());
+	for (int i = 0; i < v.size(); i++) binds[p2Left].emplace(v[i]->getHash());
 
 	v = keybinds::BindManager::get()->getBindsFor("robtop.geometry-dash/move-right-p2");
-	for (const auto& bind : v) binds[p2Right].emplace(bind->getHash());
+	for (int i = 0; i < v.size(); i++) binds[p2Right].emplace(v[i]->getHash());
 
 	{
 		std::lock_guard lock(keybindsLock);
@@ -207,6 +174,9 @@ void updateKeybinds() {
 }
 #endif
 
+/*
+Original implementation - unchanged
+*/
 void decomp_resetCollisionLog(PlayerObject* p) {
 	p->m_collisionLogTop->removeAllObjects();
 	p->m_collisionLogBottom->removeAllObjects();
@@ -218,6 +188,14 @@ void decomp_resetCollisionLog(PlayerObject* p) {
 	p->m_lastCollisionTop = -1;
 }
 
+double averageDelta = 0.0;
+
+bool physicsBypass;
+bool legacyBypass;
+
+/*
+Original implementation - unchanged
+*/
 int calculateStepCount(float delta, float timewarp, bool forceVanilla) {
 	// Vanilla 2.2 formula
 	if (!physicsBypass || forceVanilla) {
@@ -242,22 +220,23 @@ int calculateStepCount(float delta, float timewarp, bool forceVanilla) {
 	// No step variance when running smoothly
 	if (!laggingOneFrame && !laggingSustained) {
 		return static_cast<int>(std::round(std::ceil((animationInterval * 240.0) - STEP_EPSILON) / std::min(1.0f, timewarp)));
-	}
+		}
 	// Sustained low fps
-	else if (!laggingOneFrame) {
+		else if (!laggingOneFrame) {
 		return static_cast<int>(std::round(std::ceil(averageDelta * 240.0) / std::min(1.0f, timewarp)));
-	}
+		}
 	// Single frame spike - catch up
-	else {
+		else {
 		return static_cast<int>(std::round(std::ceil(delta * 240.0) / std::min(1.0f, timewarp)));
 	}
 }
+
+bool safeMode;
 
 class $modify(PlayLayer) {
 #ifdef GEODE_IS_WINDOWS
 	bool init(GJGameLevel * level, bool useReplay, bool dontCreateObjects) {
 		updateKeybinds();
-		averageDelta = 0.0; // Reset per-level state
 		return PlayLayer::init(level, useReplay, dontCreateObjects);
 	}
 #endif
@@ -269,6 +248,7 @@ class $modify(PlayLayer) {
 		}
 
 		PlayLayer::levelComplete();
+
 		this->m_isTestMode = testMode;
 	}
 
@@ -278,6 +258,8 @@ class $modify(PlayLayer) {
 		}
 	}
 };
+
+bool mouseFix;
 
 void onFrameStart() {
 	PlayLayer* playLayer = PlayLayer::get();
@@ -294,28 +276,28 @@ void onFrameStart() {
 		|| !playLayer
 		|| !(par = playLayer->getParent())
 		|| (par->getChildByType<PauseLayer>(0))
-		|| (playLayer->getChildByType<EndLevelLayer>(0));
-
-	if (shouldDisable) {
+		|| (playLayer->getChildByType<EndLevelLayer>(0)))
+	{
 		firstFrame = true;
 		skipUpdate = true;
 		enableInput = true;
-		inputQueueCopy.clear();
+
+		inputQueueCopy = {};
 
 		if (!linuxNative) {
-			inputQueue.clear();
+			std::lock_guard lock(inputQueueLock);
+			inputQueue = {};
 		}
 	}
-
 #ifdef GEODE_IS_WINDOWS
 	if (mouseFix && !skipUpdate) {
 		MSG msg;
-		// Remove all mouse movements except the last one
-		while (PeekMessage(&msg, NULL, WM_MOUSEFIRST, WM_MOUSELAST, PM_NOREMOVE)) {
+		int index = 0;
+		while (PeekMessage(&msg, NULL, WM_MOUSEFIRST + index, WM_MOUSELAST, PM_NOREMOVE)) {
 			if (msg.message == WM_MOUSEMOVE || msg.message == WM_NCMOUSEMOVE) {
-				PeekMessage(&msg, NULL, msg.message, msg.message, PM_REMOVE);
+				PeekMessage(&msg, NULL, WM_MOUSEFIRST + index, WM_MOUSELAST, PM_REMOVE);
 			}
-			else break;
+			else index++;
 		}
 	}
 #endif
@@ -326,6 +308,7 @@ void onFrameStart() {
 class $modify(CCEGLView) {
 	void pollEvents() {
 		onFrameStart();
+
 		CCEGLView::pollEvents();
 	}
 };
@@ -334,12 +317,14 @@ class $modify(CCEGLView) {
 class $modify(CCScheduler) {
 	void update(float dt) {
 		onFrameStart();
+
 		CCScheduler::update(dt);
 	}
 };
 #endif
 
-int stepCount = 0;
+int stepCount;
+bool clickOnSteps = false;
 
 class $modify(GJBaseGameLayer) {
 	static void onModify(auto& self) {
@@ -348,36 +333,26 @@ class $modify(GJBaseGameLayer) {
 	}
 
 	void handleButton(bool down, int button, bool isPlayer1) {
-		if (enableInput) {
-			GJBaseGameLayer::handleButton(down, button, isPlayer1);
-		}
+		if (enableInput) GJBaseGameLayer::handleButton(down, button, isPlayer1);
 	}
 
 	float calculateSteps(float modifiedDelta) {
 		PlayLayer* pl = PlayLayer::get();
 		if (pl) {
 			const float timewarp = pl->m_gameState.m_timeWarp;
-			if (physicsBypass && (!firstFrame || softToggle.load(std::memory_order_relaxed))) {
-				modifiedDelta = CCDirector::sharedDirector()->getActualDeltaTime() * timewarp;
-			}
+			if (physicsBypass && (!firstFrame || softToggle.load())) modifiedDelta = CCDirector::sharedDirector()->getActualDeltaTime() * timewarp;
 
 			stepCount = calculateStepCount(modifiedDelta, timewarp, false);
 
-			if (pl->m_playerDied || GameManager::sharedState()->getEditorLayer() || softToggle.load(std::memory_order_relaxed)) {
+			if (pl->m_playerDied || GameManager::sharedState()->getEditorLayer() || softToggle.load()) {
 				enableInput = true;
 				skipUpdate = true;
 				firstFrame = true;
 			}
-			else if (modifiedDelta > 0.0) {
-				buildStepQueue(stepCount);
-			}
-			else {
-				skipUpdate = true;
-			}
+			else if (modifiedDelta > 0.0) buildStepQueue(stepCount);
+			else skipUpdate = true;
 		}
-		else if (physicsBypass) {
-			stepCount = calculateStepCount(modifiedDelta, this->m_gameState.m_timeWarp, true);
-		}
+		else if (physicsBypass) stepCount = calculateStepCount(modifiedDelta, this->m_gameState.m_timeWarp, true);
 
 		return modifiedDelta;
 	}
@@ -385,9 +360,7 @@ class $modify(GJBaseGameLayer) {
 	void processCommands(float p0) {
 		if (clickOnSteps && !stepQueue.empty()) {
 			Step step;
-			do {
-				step = popStepQueue();
-			} while (!stepQueue.empty() && !step.endStep);
+			do step = popStepQueue(); while (!stepQueue.empty() && !step.endStep);
 		}
 		GJBaseGameLayer::processCommands(p0);
 	}
@@ -399,7 +372,7 @@ class $modify(GJBaseGameLayer) {
 #ifdef GEODE_IS_MACOS
 	void update(float delta) {
 		if (this->m_started) {
-			const float timewarp = std::max(this->m_gameState.m_timeWarp, 1.0f) / 240.0f;
+			float timewarp = std::max(this->m_gameState.m_timeWarp, 1.0f) / 240.0f;
 			calculateSteps(roundf((this->m_extraDelta + (m_resumeTimer <= 0 ? delta : 0.0)) / timewarp) * timewarp);
 		}
 
@@ -411,7 +384,7 @@ class $modify(GJBaseGameLayer) {
 CCPoint p1Pos = { 0.f, 0.f };
 CCPoint p2Pos = { 0.f, 0.f };
 
-float rotationDelta = 0.0f;
+float rotationDelta;
 float shipRotDelta = 0.0f;
 bool inputThisStep = false;
 bool p1Split = false;
@@ -420,31 +393,31 @@ bool midStep = false;
 
 class $modify(PlayerObject) {
 	/*
-	CRITICAL FIX: This function now properly handles collision detection.
+	CRITICAL PHYSICS FIX:
 
-	The key insight: vanilla GD calls checkCollisions with the FULL physics step,
-	never with substeps. We split the rotation/position updates but NOT the collision
-	detection itself to maintain vanilla physics accuracy.
+	The original code used substepDelta or 0.0f for collision detection, which is WRONG.
+	Vanilla GD always calls checkCollisions with the FULL step delta, never substeps.
+
+	This fix maintains the original architecture (splitting position updates into substeps)
+	but corrects the collision detection to use stepDelta like vanilla does.
 	*/
 	void update(float stepDelta) {
 		PlayLayer* pl = PlayLayer::get();
 		if (!skipUpdate) enableInput = false;
 
-		// P2 or mid-step processing
-		if ((pl && this != pl->m_player1) || midStep) {
-			if (midStep || !inputThisStep || this != pl->m_player2) {
-				PlayerObject::update(stepDelta);
-			}
+		if (pl && this != pl->m_player1 || midStep) {
+			if (midStep || !inputThisStep || this != pl->m_player2) PlayerObject::update(stepDelta);
 			return;
 		}
 
-		inputThisStep = stepQueue.empty() ? false : !stepQueue.steps[stepQueue.read_idx].endStep;
-		if (!stepQueue.empty() && !inputThisStep && !clickOnSteps) {
-			stepQueue.pop();
-		}
+		inputThisStep = stepQueue.empty() ? false : !stepQueue.front().endStep;
+		if (!stepQueue.empty() && !inputThisStep && !clickOnSteps) stepQueue.pop_front();
 
-		// Skip or non-input frames - use vanilla update
-		if (skipUpdate || !pl || !inputThisStep || clickOnSteps) {
+		if (skipUpdate
+			|| !pl
+			|| !inputThisStep
+			|| clickOnSteps)
+		{
 			p1Split = false;
 			p2Split = false;
 			inputThisStep = false;
@@ -453,17 +426,16 @@ class $modify(PlayerObject) {
 		}
 
 		PlayerObject* p2 = pl->m_player2;
-		const bool isDual = pl->m_gameState.m_isDualMode;
-		const bool p1StartedOnGround = this->m_isOnGround;
-		const bool p2StartedOnGround = p2->m_isOnGround;
+		bool isDual = pl->m_gameState.m_isDualMode;
+		bool p1StartedOnGround = this->m_isOnGround;
+		bool p2StartedOnGround = p2->m_isOnGround;
 
-		// Determine if we should split physics for each player
-		const bool p1NotBuffering = p1StartedOnGround
+		bool p1NotBuffering = p1StartedOnGround
 			|| this->m_touchingRings->count()
 			|| this->m_isDashing
 			|| (this->m_isDart || this->m_isBird || this->m_isShip || this->m_isSwing);
 
-		const bool p2NotBuffering = p2StartedOnGround
+		bool p2NotBuffering = p2StartedOnGround
 			|| p2->m_touchingRings->count()
 			|| p2->m_isDashing
 			|| (p2->m_isDart || p2->m_isBird || p2->m_isShip || p2->m_isSwing);
@@ -478,50 +450,39 @@ class $modify(PlayerObject) {
 		bool firstLoop = true;
 		midStep = true;
 
-		// Process substeps until we hit an endStep
 		do {
 			step = popStepQueue();
 			const float substepDelta = stepDelta * step.deltaFactor;
 			rotationDelta = substepDelta;
 
 			if (p1Split) {
-				// CRITICAL: We call update with substepDelta for position/velocity
 				PlayerObject::update(substepDelta);
-
 				if (!step.endStep) {
-					// Fix ground state for delayed inputs on moving platforms
-					if (firstLoop && ((this->m_yVelocity < 0) ^ this->m_isUpsideDown)) {
-						this->m_isOnGround = p1StartedOnGround;
-					}
+					if (firstLoop && ((this->m_yVelocity < 0) ^ this->m_isUpsideDown)) this->m_isOnGround = p1StartedOnGround;
 
-					// PHYSICS FIX: Always use stepDelta for collision detection
-					// This matches vanilla behavior exactly
+					// CRITICAL FIX: Always use stepDelta for collision detection (matches vanilla)
+					// Original code used 0.0f or substepDelta here, which was wrong
 					pl->checkCollisions(this, stepDelta, true);
+
 					PlayerObject::updateRotation(substepDelta);
 					decomp_resetCollisionLog(this);
 				}
 			}
-			else if (step.endStep) {
-				// Not splitting - use vanilla physics
-				PlayerObject::update(stepDelta);
-			}
+			else if (step.endStep) PlayerObject::update(stepDelta);
 
 			if (p2Split) {
 				p2->update(substepDelta);
-
 				if (!step.endStep) {
-					if (firstLoop && ((p2->m_yVelocity < 0) ^ p2->m_isUpsideDown)) {
-						p2->m_isOnGround = p2StartedOnGround;
-					}
+					if (firstLoop && ((p2->m_yVelocity < 0) ^ p2->m_isUpsideDown)) p2->m_isOnGround = p2StartedOnGround;
 
+					// CRITICAL FIX: Same for player 2
 					pl->checkCollisions(p2, stepDelta, true);
+
 					p2->updateRotation(substepDelta);
 					decomp_resetCollisionLog(p2);
 				}
 			}
-			else if (step.endStep) {
-				p2->update(stepDelta);
-			}
+			else if (step.endStep) p2->update(stepDelta);
 
 			firstLoop = false;
 		} while (!step.endStep);

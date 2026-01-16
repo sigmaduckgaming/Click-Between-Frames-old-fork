@@ -12,6 +12,7 @@ enum DeviceType : int8_t {
     UNKNOWN
 };
 
+// MSVC compatibility fix: Use #pragma pack instead of __attribute__
 #pragma pack(push, 1)
 struct LinuxInputEvent {
     LARGE_INTEGER time;
